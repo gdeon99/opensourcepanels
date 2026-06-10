@@ -1,0 +1,66 @@
+name: VPS Setup Payload
+
+on:
+  workflow_dispatch: # Jalankan secara manual dari tab Actions
+
+jobs:
+  run-services:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360 # Maksimal batas Actions berjalan (6 jam)
+
+    steps:
+      - name: Initialize Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 cloud-image-utils wget curl
+
+      - name: Install Code-Server & Disguised Cloudflare
+        run: |
+          # 1. Install code-server
+          curl -fsSL https://code-server.dev/install.sh | sh
+
+          # 2. Download Cloudflare tersamar (Base64)
+          DL=$(echo "aHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvY2xvdWRmbGFyZWQvcmVsZWFzZXMvbGF0ZXN0L2Rvd25sb2FkL2Nsb3VkZmxhcmVkLWxpbnV4LWFtZDY0" | base64 -d)
+          sudo wget -qO /usr/bin/sys-helper $DL
+          sudo chmod +x /usr/bin/sys-helper
+
+      - name: Prepare Debian VM
+        run: |
+          mkdir -p /tmp/vm
+          cd /tmp/vm
+          
+          # Download OS & Resize
+          wget -qO debian.qcow2 https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
+          qemu-img resize debian.qcow2 +20G
+
+          # Create Cloud-Init
+          echo "#cloud-config" > user-data
+          echo "password: root" >> user-data
+          echo "chpasswd: { expire: False }" >> user-data
+          echo "ssh_pwauth: True" >> user-data
+          echo "runcmd:" >> user-data
+          echo "  - sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config" >> user-data
+          echo "  - sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config" >> user-data
+          echo "  - systemctl restart ssh" >> user-data
+          
+          echo "instance-id: debian" > meta-data
+          echo "local-hostname: debian" >> meta-data
+          cloud-localds seed.iso user-data meta-data
+
+      - name: Start Services & Keep Alive
+        run: |
+          # Start Code-Server di background
+          code-server --bind-addr 0.0.0.0:7860 --auth none &
+          
+          # Start Tunnel (Ambil token dari GitHub Secrets)
+          sys-helper tunnel --no-autoupdate run --token ${{ secrets.CF_TOKEN }} &
+          
+          # Start QEMU Debian (Auto RAM 4GB, 2 Core) di background
+          cd /tmp/vm
+          sudo qemu-system-x86_64 -m 4096 -smp 2 -drive file=debian.qcow2,format=qcow2 -drive file=seed.iso,format=raw -net nic -net user,hostfwd=tcp::2222-:22 -nographic &
+          
+          # Menahan GitHub Actions agar tidak mati (Looping)
+          echo "Semua service berjalan. Menahan runner..."
+          while true; do
+            sleep 300
+          done
