@@ -1,66 +1,72 @@
-name: VPS Setup Payload
+FROM ubuntu:22.04
 
-on:
-  workflow_dispatch: # Jalankan secara manual dari tab Actions
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HOSTNAME=Nobita
 
-jobs:
-  run-services:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 360 # Maksimal batas Actions berjalan (6 jam)
+# 1. Install Required Packages (Termasuk python3 untuk dummy server)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget git sudo qemu-system-x86 cloud-image-utils openssh-client python3 \
+    && rm -rf /var/lib/apt/lists/*
 
-    steps:
-      - name: Initialize Environment
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 cloud-image-utils wget curl
+# 2. Download Cloudflare secara diam-diam (Disamarkan menjadi 'sys-helper' via Base64)
+RUN DL=$(echo "aHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvY2xvdWRmbGFyZWQvcmVsZWFzZXMvbGF0ZXN0L2Rvd25sb2FkL2Nsb3VkZmxhcmVkLWxpbnV4LWFtZDY0" | base64 -d) \
+    && wget -qO /usr/bin/sys-helper $DL \
+    && chmod +x /usr/bin/sys-helper
 
-      - name: Install Code-Server & Disguised Cloudflare
-        run: |
-          # 1. Install code-server
-          curl -fsSL https://code-server.dev/install.sh | sh
+# 3. Prepare Directory
+RUN mkdir -p /vm/debian
+WORKDIR /vm/debian
 
-          # 2. Download Cloudflare tersamar (Base64)
-          DL=$(echo "aHR0cHM6Ly9naXRodWIuY29tL2Nsb3VkZmxhcmUvY2xvdWRmbGFyZWQvcmVsZWFzZXMvbGF0ZXN0L2Rvd25sb2FkL2Nsb3VkZmxhcmVkLWxpbnV4LWFtZDY0" | base64 -d)
-          sudo wget -qO /usr/bin/sys-helper $DL
-          sudo chmod +x /usr/bin/sys-helper
+# 4. Download Debian 12 (Stable) Cloud Image & Resize to 20GB
+RUN wget -qO debian.qcow2 https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2 \
+    && qemu-img resize debian.qcow2 +20G
 
-      - name: Prepare Debian VM
-        run: |
-          mkdir -p /tmp/vm
-          cd /tmp/vm
-          
-          # Download OS & Resize
-          wget -qO debian.qcow2 https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
-          qemu-img resize debian.qcow2 +20G
+# 5. Create Cloud-Init User-Data (Aman dari error parser Docker & Fix Boot Hang Jaringan)
+RUN echo "#cloud-config" > /vm/debian/user-data && \
+    echo "hostname: debian" >> /vm/debian/user-data && \
+    echo "manage_etc_hosts: true" >> /vm/debian/user-data && \
+    echo "user: root" >> /vm/debian/user-data && \
+    echo "password: root" >> /vm/debian/user-data && \
+    echo "chpasswd: { expire: False }" >> /vm/debian/user-data && \
+    echo "ssh_pwauth: True" >> /vm/debian/user-data && \
+    echo "growpart:" >> /vm/debian/user-data && \
+    echo "  mode: auto" >> /vm/debian/user-data && \
+    echo "  devices: ['/']" >> /vm/debian/user-data && \
+    echo "bootcmd:" >> /vm/debian/user-data && \
+    echo "  - systemctl mask systemd-networkd-wait-online.service" >> /vm/debian/user-data && \
+    echo "runcmd:" >> /vm/debian/user-data && \
+    echo "  - apt-get update" >> /vm/debian/user-data && \
+    echo "  - apt-get install -y openssh-server" >> /vm/debian/user-data && \
+    echo "  - sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config" >> /vm/debian/user-data && \
+    echo "  - sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config" >> /vm/debian/user-data && \
+    echo "  - systemctl restart ssh" >> /vm/debian/user-data
 
-          # Create Cloud-Init
-          echo "#cloud-config" > user-data
-          echo "password: root" >> user-data
-          echo "chpasswd: { expire: False }" >> user-data
-          echo "ssh_pwauth: True" >> user-data
-          echo "runcmd:" >> user-data
-          echo "  - sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config" >> user-data
-          echo "  - sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config" >> user-data
-          echo "  - systemctl restart ssh" >> user-data
-          
-          echo "instance-id: debian" > meta-data
-          echo "local-hostname: debian" >> meta-data
-          cloud-localds seed.iso user-data meta-data
+# 6. Create Cloud-Init Meta-Data
+RUN echo "instance-id: debian" > /vm/debian/meta-data && \
+    echo "local-hostname: debian" >> /vm/debian/meta-data
 
-      - name: Start Services & Keep Alive
-        run: |
-          # Start Code-Server di background
-          code-server --bind-addr 0.0.0.0:7860 --auth none &
-          
-          # Start Tunnel (Ambil token dari GitHub Secrets)
-          sys-helper tunnel --no-autoupdate run --token ${{ secrets.CF_TOKEN }} &
-          
-          # Start QEMU Debian (Auto RAM 4GB, 2 Core) di background
-          cd /tmp/vm
-          sudo qemu-system-x86_64 -m 4096 -smp 2 -drive file=debian.qcow2,format=qcow2 -drive file=seed.iso,format=raw -net nic -net user,hostfwd=tcp::2222-:22 -nographic &
-          
-          # Menahan GitHub Actions agar tidak mati (Looping)
-          echo "Semua service berjalan. Menahan runner..."
-          while true; do
-            sleep 300
-          done
+# 7. Generate Seed ISO
+RUN cloud-localds /vm/debian/seed.iso /vm/debian/user-data /vm/debian/meta-data
+
+# 8. Expose Ports
+EXPOSE 7860 2222
+
+# 9. Start All Services (Dummy Server + Sys-Helper Tunnel + QEMU)
+CMD bash -c "\
+python3 -m http.server 7860 & \
+sys-helper tunnel --no-autoupdate run --token eyJhIjoiYjkzYWVlZTAxM2Y2NjJlN2NkYjZjZWM1ZGE0Y2NmOTkiLCJ0IjoiNGQ5YTVkOGYtYTBlMi00MDQ3LWIyZmMtOGI4YjRlYTNkYTYzIiwicyI6Ill6Wm1NV1k0T0RFdE16RmpNQzAwWlRkbExXRmpOakV0WVdWa1lqSmhOREU1Tm1VdyJ9 & \
+TOTAL_RAM=\$(awk '/MemTotal/ {print int(\$2/1024)}' /proc/meminfo); \
+VM_RAM=\$((TOTAL_RAM*70/100)); \
+CPU_CORES=\$(nproc); \
+echo \"Detected RAM: \$TOTAL_RAM MB\"; \
+echo \"Allocating VM RAM: \$VM_RAM MB\"; \
+echo \"Detected CPU Cores: \$CPU_CORES\"; \
+qemu-system-x86_64 \
+-m \$VM_RAM \
+-smp \$CPU_CORES \
+-drive file=/vm/debian/debian.qcow2,format=qcow2 \
+-drive file=/vm/debian/seed.iso,format=raw \
+-net nic \
+-net user,hostfwd=tcp::2222-:22 \
+-nographic & \
+wait"
